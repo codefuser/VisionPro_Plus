@@ -49,9 +49,8 @@ export function transliterate(tamilStr: string): string {
   }
 
   const keys = Object.keys(tamilMap).sort((a, b) => b.length - a.length);
-  for (const k of keys) {
-    result = result.replace(new RegExp(k, 'g'), tamilMap[k]);
-  }
+  const combined = new RegExp(keys.map((k) => k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|'), 'g');
+  result = result.replace(combined, (m) => tamilMap[m]);
   
   result = result.replace(/yesae/g, 'yese');
   result = result.replace(/iyaesu/g, 'yesu');
@@ -136,6 +135,24 @@ export function normalizeText(text: string): string {
 // Alias for migration backwards compatibility
 export function normalizeTanglishQuery(query: string): string {
   return normalizeText(query);
+}
+
+// Build a searchable keyword blob for a song. It contains:
+//  - the original (Tamil) text, for direct Tamil substring search
+//  - the canonical transliteration skeleton (vowels collapsed, sound-alikes
+//    merged via normalizeToken) of both title and lyrics. Because every
+//    romanization variant (umakkaga / umakaaga / umakaga) maps to the same
+//    skeleton, all of them match.
+export function buildSearchKeywords(title: string, lyrics: string): string {
+  const parts: string[] = [];
+  const add = (text: string) => {
+    if (!text) return;
+    parts.push(text);
+    parts.push(normalizeText(transliterate(text)));
+  };
+  add(title ?? '');
+  add(lyrics ?? '');
+  return parts.join(' ');
 }
 
 export function smartSplitSlides(content: string): string[] {
@@ -242,169 +259,82 @@ export async function performSongSearch(query: string) {
   
   if (!trimmed) return [];
 
-  // Check if query contains Tamil characters
-  const isTamilScript = /[\u0B80-\u0BFF]/.test(trimmed);
-  
-  if (isTamilScript) {
-    const cleanTerm = trimmed.replace(/"/g, '').replace(/'/g, '');
-    const tamilTokens = cleanTerm.split(/\s+/).filter(Boolean);
-    const matchExpr = `title:(${tamilTokens.map(t => `"${t}"*`).join(' OR ')}) OR lyrics:(${tamilTokens.map(t => `"${t}"*`).join(' OR ')})`;
-    
-    const rawRows = await query<any>(db, `
-      SELECT s.id, s.title, s.content, s.artist, s.album, s.scale
-      FROM songs_fts f
-      JOIN songs s ON f.rowid = s.id
-      WHERE songs_fts MATCH ?
-      ORDER BY bm25(songs_fts) ASC
-      LIMIT 120
-    `, [matchExpr]);
-    
-    const results = rawRows.map(song => {
-      let score = 0;
-      if (song.title === trimmed) score += 200;
-      else if (song.title.includes(trimmed)) score += 120;
-      else if (song.content.includes(trimmed)) score += 80;
-      
-      let matched = 0;
-      for (const t of tamilTokens) {
-        if (song.title.includes(t) || song.content.includes(t)) matched++;
-      }
-      score += (matched / tamilTokens.length) * 50;
-      
-      return { ...song, score };
-    });
-    
-    results.sort((a, b) => b.score - a.score);
-    return results.slice(0, 50).map(r => ({
-      id: r.id,
-      title: r.title || '',
-      content: r.content || '',
-      artist: r.artist || '',
-      album: r.album || '',
-      scale: r.scale || '',
-      slides: smartSplitSlides(r.content || '')
-    }));
+  // Unified Tamil + Tanglish + fuzzy search (see buildSearchKeywords)
+  // Build FTS match tokens: Tamil kept verbatim, Latin normalized to the same
+  // canonical skeleton used when indexing. Trigram tokenizer makes this a
+  // substring match (so "vaal" inside "vazhkiren" works).
+  const matchTokens: string[] = [];
+  for (const t of trimmed.split(/\s+/).filter(Boolean)) {
+    if (/[\u0B80-\u0BFF]/.test(t)) {
+      matchTokens.push(t.replace(/["\\]/g, ''));
+    } else {
+      const sk = normalizeToken(t);
+      if (sk) matchTokens.push(sk.replace(/["\\]/g, ''));
+    }
   }
+  if (matchTokens.length === 0) return [];
 
-  // Tanglish/Normalized Search
-  const queryNorm = normalizeText(trimmed);
-  const queryTokens = queryNorm.split(/\s+/).filter(Boolean);
-  if (queryTokens.length === 0) return [];
+  // OR semantics: a song matching ANY query token is a candidate, so a
+  // single fuzzy/misspelled token can't exclude the right song. Ranking by
+  // token coverage (with fuzzy tolerance) then brings the best song to top.
+  const matchExpr = matchTokens.join(' OR ');
 
-  const matchExpr = `normalized_tanglish_lyrics:(${queryTokens.join(' OR ')}) OR tanglish_title:(${queryTokens.join(' OR ')})`;
-  
   const rawRows = await query<any>(db, `
-    SELECT s.id, s.title, s.content, s.artist, s.album, s.scale, s.tanglish_title, s.tanglish_lyrics, s.normalized_tanglish_lyrics
+    SELECT s.id, s.title, s.content, s.artist, s.album, s.scale, s.search_keywords
     FROM songs_fts f
     JOIN songs s ON f.rowid = s.id
     WHERE songs_fts MATCH ?
     ORDER BY bm25(songs_fts) ASC
-    LIMIT 120
+    LIMIT 200
   `, [matchExpr]);
 
+  const queryLower = trimmed.toLowerCase();
   const results: any[] = [];
-  
+
   for (const song of rawRows) {
-    let score = 0;
-    
-    // Layer 2: Exact/Substring Tanglish Match
-    const cleanQuery = trimmed.toLowerCase();
-    const tanglishTitleLower = (song.tanglish_title || '').toLowerCase();
-    const tanglishLyricsLower = (song.tanglish_lyrics || '').toLowerCase();
-    
-    if (tanglishTitleLower === cleanQuery) {
-      score += 200;
-    } else if (tanglishTitleLower.includes(cleanQuery)) {
-      score += 120;
-    } else if (tanglishLyricsLower.includes(cleanQuery)) {
-      score += 80;
-    }
-    
-    // Layer 3 & 6: Normalized Tanglish Token Match & Partial Lyric Match
-    const uniqueQueryTokens = Array.from(new Set(queryTokens));
-    const songNormTitle = normalizeText(song.tanglish_title || '');
-    const songNormLyrics: string = song.normalized_tanglish_lyrics || normalizeText(song.tanglish_lyrics || '');
-    const songTitleTokens = songNormTitle.split(/\s+/).filter(Boolean);
-    const songLyricsTokens = songNormLyrics.split(/\s+/).filter(Boolean);
-    
-    let matchedCount = 0;
-    let titleTokenPoints = 0;
-    let lyricTokenPoints = 0;
-    
-    for (const qToken of uniqueQueryTokens) {
-      let tokenMatched = false;
-      if (songTitleTokens.some((t: string) => t === qToken || t.startsWith(qToken))) {
-        titleTokenPoints += 30;
-        tokenMatched = true;
-      }
-      if (songLyricsTokens.some((t: string) => t === qToken || t.startsWith(qToken))) {
-        lyricTokenPoints += 15;
-        tokenMatched = true;
-      }
-      if (tokenMatched) matchedCount++;
-    }
-    
-    score += titleTokenPoints + lyricTokenPoints;
-    
-    const matchRatio = matchedCount / uniqueQueryTokens.length;
-    let ratioBoost = 0;
-    if (matchRatio === 1.0) ratioBoost = 150;
-    else if (matchRatio >= 0.8) ratioBoost = 100;
-    else ratioBoost = matchRatio * 50;
-    score += ratioBoost;
-    
-    // Proximity / Contiguous Phrase Match
-    if (queryTokens.length > 1) {
-      let phraseTitlePoints = 0;
-      let phraseLyricsPoints = 0;
-      for (let len = 2; len <= queryTokens.length; len++) {
-        for (let start = 0; start <= queryTokens.length - len; start++) {
-          const subphrase = queryTokens.slice(start, start + len).join(' ');
-          if (songNormTitle.includes(subphrase)) {
-            phraseTitlePoints += len * 25;
-          } else if (songNormLyrics.includes(subphrase)) {
-            phraseLyricsPoints += len * 20;
+    const titleLower = (song.title || '').toLowerCase();
+    const kw = (song.search_keywords || '').toLowerCase();
+    const kwTokens = kw.split(/\s+/);
+
+    let covered = 0;
+    for (const q of matchTokens) {
+      const ql = q.toLowerCase();
+      if (!ql) continue;
+      let matched = false;
+      if (kw.includes(ql)) {
+        matched = true;
+      } else {
+        for (const kt of kwTokens) {
+          if (!kt) continue;
+          if (kt.includes(ql) || ql.includes(kt) || levenshtein(ql, kt) <= 2) {
+            matched = true;
+            break;
           }
         }
       }
-      score += phraseTitlePoints + phraseLyricsPoints;
+      if (matched) covered++;
     }
-    
-    // Layer 4: Fuzzy Match (Levenshtein distance) on single token queries
-    if (queryTokens.length === 1) {
-      const qToken = queryTokens[0];
-      for (const t of songTitleTokens) {
-        if (Math.abs(t.length - qToken.length) <= 2) {
-          const dist = levenshtein(t, qToken);
-          if (dist === 1) score += 15;
-          else if (dist === 2) score += 5;
-        }
-      }
-    }
-    
-    // Layer 5: Trigram Similarity Match
-    const titleSim = trigramSimilarity(queryNorm, songNormTitle);
-    score += titleSim * 40;
-    
-    const lyricSample = songNormLyrics.substring(0, 200);
-    const lyricSim = trigramSimilarity(queryNorm, lyricSample);
-    score += lyricSim * 20;
-    
-    if (score > 10) {
-      results.push({
-        id: song.id,
-        title: song.title || '',
-        content: song.content || '',
-        artist: song.artist || '',
-        album: song.album || '',
-        scale: song.scale || '',
-        score: score
-      });
-    }
+
+    // Priority: exact title > title contains query > token coverage
+    let score = 0;
+    if (titleLower === queryLower) score += 1000;
+    if (titleLower.includes(queryLower)) score += 300;
+    score += covered * 100;
+    score += Math.round((covered / matchTokens.length) * 200);
+
+    results.push({
+      id: song.id,
+      title: song.title || '',
+      content: song.content || '',
+      artist: song.artist || '',
+      album: song.album || '',
+      scale: song.scale || '',
+      score,
+    });
   }
-  
+
   results.sort((a, b) => b.score - a.score);
-  
+
   return results.slice(0, 50).map(r => ({
     id: r.id,
     title: r.title,
@@ -412,6 +342,7 @@ export async function performSongSearch(query: string) {
     artist: r.artist,
     album: r.album,
     scale: r.scale,
-    slides: smartSplitSlides(r.content)
+    slides: smartSplitSlides(r.content),
   }));
 }
+

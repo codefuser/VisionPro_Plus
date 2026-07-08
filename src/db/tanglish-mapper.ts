@@ -1,5 +1,5 @@
 import { getTamilSongsDb, query, run, isUsingRemote } from './sqlite';
-import { transliterate, normalizeText } from '../server/songs';
+import { transliterate, normalizeText, buildSearchKeywords } from '../server/songs';
 
 async function runMigration() {
   // On a remote (Turso) database the dataset is seeded once via the seed
@@ -23,6 +23,7 @@ async function runMigration() {
     { name: 'tanglish_title', type: 'TEXT' },
     { name: 'tanglish_lyrics', type: 'TEXT' },
     { name: 'normalized_tanglish_lyrics', type: 'TEXT' },
+    { name: 'search_keywords', type: 'TEXT' },
   ];
 
   for (const rc of requiredColumns) {
@@ -46,7 +47,8 @@ async function runMigration() {
         normalized_lyrics = ?,
         tanglish_title = ?,
         tanglish_lyrics = ?,
-        normalized_tanglish_lyrics = ?
+        normalized_tanglish_lyrics = ?,
+        search_keywords = ?
     WHERE id = ?
   `;
 
@@ -69,12 +71,15 @@ async function runMigration() {
         normalizeText(tanglish_title) + ' ' + normalizeText(tanglish_lyrics)
       ).trim();
 
+      const search_keywords = buildSearchKeywords(title, content);
+
       await run(db, updateSql, [
         lyrics,
         normalized_lyrics,
         tanglish_title,
         tanglish_lyrics,
         normalized_tanglish_lyrics,
+        search_keywords,
         song.id,
       ]);
     }
@@ -92,19 +97,16 @@ async function runMigration() {
   await run(db, `
     CREATE VIRTUAL TABLE songs_fts USING fts5(
         title,
+        search_keywords,
         lyrics,
-        normalized_lyrics,
-        tanglish_title,
-        tanglish_lyrics,
-        normalized_tanglish_lyrics,
         content=songs,
         content_rowid=id,
-        tokenize='unicode61'
+        tokenize='trigram'
     );
   `);
   const ftsInfo = await run(db, `
-    INSERT INTO songs_fts(rowid, title, lyrics, normalized_lyrics, tanglish_title, tanglish_lyrics, normalized_tanglish_lyrics)
-    SELECT id, title, lyrics, normalized_lyrics, tanglish_title, tanglish_lyrics, normalized_tanglish_lyrics FROM songs
+    INSERT INTO songs_fts(rowid, title, search_keywords, lyrics)
+    SELECT id, title, search_keywords, lyrics FROM songs
   `);
 
   console.log('--- Migration Complete ---');

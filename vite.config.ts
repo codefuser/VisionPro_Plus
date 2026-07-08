@@ -12,12 +12,12 @@ export default defineConfig({
     // nitro/vite builds from this
     server: { 
       entry: "server",
-      preset: "node-server"
+      preset: "vercel"
     },
   },
   vite: {
     ssr: {
-      external: ["better-sqlite3"],
+      external: ["@libsql/client"],
     },
   }
 });

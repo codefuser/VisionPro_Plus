@@ -1,4 +1,4 @@
-import { getTamilSongsDb } from '../db/sqlite';
+import { getTamilSongsDb, query } from '../db/sqlite';
 
 // Phonetic Tamil to Tanglish Mapper
 const tamilMap: Record<string, string> = {
@@ -171,9 +171,9 @@ export function smartSplitSlides(content: string): string[] {
 export async function getSongsByIds(ids: number[]) {
     const data = { ids };
     if (!data.ids || data.ids.length === 0) return [];
-    const db = getTamilSongsDb();
+    const db = await getTamilSongsDb();
     const placeholders = data.ids.map(() => '?').join(',');
-    const rawRows = db.prepare(`SELECT * FROM songs WHERE id IN (${placeholders})`).all(...data.ids) as any[];
+    const rawRows = await query<any>(db, `SELECT * FROM songs WHERE id IN (${placeholders})`, data.ids);
     return rawRows.map(r => ({
       id: r.id,
       title: r.title || '',
@@ -186,8 +186,8 @@ export async function getSongsByIds(ids: number[]) {
 }
 
 export async function getAllSongs() {
-    const db = getTamilSongsDb();
-    const rawRows = db.prepare(`SELECT * FROM songs`).all() as any[];
+    const db = await getTamilSongsDb();
+    const rawRows = await query<any>(db, `SELECT * FROM songs`);
     return rawRows.map(r => ({
       id: r.id, title: r.title || '', content: r.content || '',
       artist: r.artist || '', album: r.album || '', scale: r.scale || ''
@@ -236,8 +236,8 @@ function trigramSimilarity(a: string, b: string): number {
 }
 
 // Redesigned FTS + JS similarity scorer
-export function performSongSearch(query: string) {
-  const db = getTamilSongsDb();
+export async function performSongSearch(query: string) {
+  const db = await getTamilSongsDb();
   const trimmed = query.trim();
   
   if (!trimmed) return [];
@@ -250,14 +250,14 @@ export function performSongSearch(query: string) {
     const tamilTokens = cleanTerm.split(/\s+/).filter(Boolean);
     const matchExpr = `title:(${tamilTokens.map(t => `"${t}"*`).join(' OR ')}) OR lyrics:(${tamilTokens.map(t => `"${t}"*`).join(' OR ')})`;
     
-    const rawRows = db.prepare(`
+    const rawRows = await query<any>(db, `
       SELECT s.id, s.title, s.content, s.artist, s.album, s.scale
       FROM songs_fts f
       JOIN songs s ON f.rowid = s.id
       WHERE songs_fts MATCH ?
       ORDER BY bm25(songs_fts) ASC
       LIMIT 120
-    `).all(matchExpr) as any[];
+    `, [matchExpr]);
     
     const results = rawRows.map(song => {
       let score = 0;
@@ -293,14 +293,14 @@ export function performSongSearch(query: string) {
 
   const matchExpr = `normalized_tanglish_lyrics:(${queryTokens.join(' OR ')}) OR tanglish_title:(${queryTokens.join(' OR ')})`;
   
-  const rawRows = db.prepare(`
+  const rawRows = await query<any>(db, `
     SELECT s.id, s.title, s.content, s.artist, s.album, s.scale, s.tanglish_title, s.tanglish_lyrics, s.normalized_tanglish_lyrics
     FROM songs_fts f
     JOIN songs s ON f.rowid = s.id
     WHERE songs_fts MATCH ?
     ORDER BY bm25(songs_fts) ASC
     LIMIT 120
-  `).all(matchExpr) as any[];
+  `, [matchExpr]);
 
   const results: any[] = [];
   

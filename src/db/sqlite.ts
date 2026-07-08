@@ -1,38 +1,80 @@
-import Database from 'better-sqlite3';
+import { createClient, type Client } from '@libsql/client';
 import path from 'path';
 
-const DATA_DIR = path.resolve(process.cwd(), 'data');
+type DbKind = 'en' | 'ta' | 'songs';
 
-export const englishBibleDbPath = path.join(DATA_DIR, 'english_bible.db');
-export const tamilBibleDbPath = path.join(DATA_DIR, 'tamil_bible.db');
-export const tamilSongsDbPath = path.join(DATA_DIR, 'tamilsongs.sqlite');
+const LOCAL_URLS: Record<DbKind, string> = {
+  en: 'file:' + path.resolve(process.cwd(), 'data', 'english_bible.db'),
+  ta: 'file:' + path.resolve(process.cwd(), 'data', 'tamil_bible.db'),
+  songs: 'file:' + path.resolve(process.cwd(), 'data', 'tamilsongs.sqlite'),
+};
 
-function initDb(dbPath: string) {
-  const db = new Database(dbPath, { readonly: false });
-  
-  // Configure SQLite for fast local reads
-  db.pragma('journal_mode = WAL');
-  db.pragma('synchronous = NORMAL');
-  db.pragma('cache_size = -20000'); // 20MB cache
-  
-  return db;
+const REMOTE_ENV: Record<DbKind, string> = {
+  en: 'TURSO_URL_EN',
+  ta: 'TURSO_URL_TA',
+  songs: 'TURSO_URL_SONGS',
+};
+
+function resolveUrl(kind: DbKind): string {
+  return process.env[REMOTE_ENV[kind]] || LOCAL_URLS[kind];
 }
 
-let englishBibleDb: ReturnType<typeof Database> | null = null;
-let tamilBibleDb: ReturnType<typeof Database> | null = null;
-let tamilSongsDb: ReturnType<typeof Database> | null = null;
+const clients: Partial<Record<DbKind, Client>> = {};
 
-export function getEnglishBibleDb() {
-  if (!englishBibleDb) englishBibleDb = initDb(englishBibleDbPath);
-  return englishBibleDb;
+function getClient(kind: DbKind): Client {
+  if (!clients[kind]) {
+    const url = resolveUrl(kind);
+    const isLocal = url.startsWith('file:');
+    clients[kind] = createClient({
+      url,
+      authToken: isLocal ? undefined : process.env.TURSO_AUTH_TOKEN,
+    });
+  }
+  return clients[kind]!;
 }
 
-export function getTamilBibleDb() {
-  if (!tamilBibleDb) tamilBibleDb = initDb(tamilBibleDbPath);
-  return tamilBibleDb;
+export function getEnglishBibleDb(): Promise<Client> {
+  return Promise.resolve(getClient('en'));
 }
 
-export function getTamilSongsDb() {
-  if (!tamilSongsDb) tamilSongsDb = initDb(tamilSongsDbPath);
-  return tamilSongsDb;
+export function getTamilBibleDb(): Promise<Client> {
+  return Promise.resolve(getClient('ta'));
+}
+
+export function getTamilSongsDb(): Promise<Client> {
+  return Promise.resolve(getClient('songs'));
+}
+
+export function isUsingRemote(): boolean {
+  return Boolean(
+    process.env.TURSO_URL_EN ||
+    process.env.TURSO_URL_TA ||
+    process.env.TURSO_URL_SONGS,
+  );
+}
+
+export async function query<T = Record<string, any>>(
+  db: Client,
+  sql: string,
+  args: unknown[] = [],
+): Promise<T[]> {
+  const res = await db.execute({ sql, args });
+  return res.rows as T[];
+}
+
+export async function queryOne<T = Record<string, any>>(
+  db: Client,
+  sql: string,
+  args: unknown[] = [],
+): Promise<T | undefined> {
+  const res = await db.execute({ sql, args });
+  return (res.rows[0] as T) ?? undefined;
+}
+
+export async function run(
+  db: Client,
+  sql: string,
+  args: unknown[] = [],
+): Promise<void> {
+  await db.execute({ sql, args });
 }
